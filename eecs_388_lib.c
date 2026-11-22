@@ -2,11 +2,15 @@
  *   Header Includes
  *******************************************************************************/
 #include <avr/io.h>
+#include <util/delay.h>
+#include <util/twi.h>
 #include <stdint.h>
 
 #include "eecs_388_lib.h"
 #include "wiring_private.h"
 #include "pins_arduino.h"
+
+#define SCL_CLOCK (100000L)  // 100kHz I2C clock speed
 
 /******************************************************************************
  *   Static functions
@@ -78,15 +82,15 @@ static void turnOffPWM(uint8_t timer)
  *   Library functions
  *******************************************************************************/
 
- /******************************************************************************
- *   Function: delay_ms() - Delay Milliseconds
- *      Pre condition: 
- *          None
- *      Post condition: 
- *          Delay execution of the next instruction by amount specified by
- * 			'ms'. Configured for 16MHz ATMega328P clock
- *******************************************************************************/
- void delay_ms(unsigned long ms)
+/******************************************************************************
+*   Function: delay_ms() - Delay Milliseconds
+*      Pre condition: 
+*          None
+*      Post condition: 
+*          Delay execution of the next instruction by amount specified by
+* 			'ms'. Configured for 16MHz ATMega328P clock
+*******************************************************************************/
+void delay_ms(unsigned long ms)
 {
 	uint32_t start = micros();
 
@@ -99,14 +103,51 @@ static void turnOffPWM(uint8_t timer)
 	}
 }
 
- /******************************************************************************
- *   Function: gpio_mode() - GPIO Mode
- *      Pre condition: 
- *          This should be called during the setup() initialization function
- *      Post condition: 
- *          GPIO specified by 'pin' will be configured in the mode specified by
- * 			'mode' (either GPIO_OUTPUT or GPIO_INPUT)
- *******************************************************************************/
+/******************************************************************************
+*   Function: delay_us() - Delay Microseconds 
+*      Pre condition: 
+*          None
+*      Post condition: 
+*          Delay execution of the next instruction by amount specified by
+* 		   'us'. Configured for 16MHz ATMega328P clock. 
+*		   NOTE: this implementation only works between 0-16,000 microseconds!
+*
+*******************************************************************************/
+void delay_us(uint16_t us) 
+{
+	// for the 16 MHz clock
+
+	// for a one-microsecond delay, simply return.  the overhead
+	// of the function call takes 14 (16) cycles, which is 1us
+	if (us <= 1) return; //  = 3 cycles, (4 when true)
+
+	// the following loop takes 1/4 of a microsecond (4 cycles)
+	// per iteration, so execute it four times for each microsecond of
+	// delay requested.
+	us <<= 2; // x4 us, = 4 cycles
+
+	// account for the time taken in the preceding commands.
+	// we just burned 19 (21) cycles above, remove 5, (5*4=20)
+	// us is at least 8 so we can subtract 5
+	us -= 5; // = 2 cycles,
+
+	// busy wait
+	__asm__ __volatile__ (
+		"1: sbiw %0,1" "\n\t" // 2 cycles
+		"brne 1b" : "=w" (us) : "0" (us) // 2 cycles
+	);
+	// return = 4 cycles
+
+}
+
+/******************************************************************************
+*   Function: gpio_mode() - GPIO Mode
+*      Pre condition: 
+*          This should be called during the setup() initialization function
+*      Post condition: 
+*          GPIO specified by 'pin' will be configured in the mode specified by
+* 			'mode' (either GPIO_OUTPUT or GPIO_INPUT)
+*******************************************************************************/
 void gpio_mode(uint8_t pin, uint8_t mode)
 {
 uint8_t bit = digitalPinToBitMask(pin);
@@ -170,19 +211,100 @@ SREG = oldSREG;
 return;
 }
 
-void uart_init() {
-    /*  Task 1.1 - Update baud rate with ubrr value. Initialize ubrr to calculated value */
-	uint16_t ubrr = 16;
-	UBRR0H = (ubrr >> 8);
-    UBRR0L = ubrr;
+void i2c_init(void) {
+  TWSR = 0x00;
+  TWBR = ((F_CPU / SCL_CLOCK) - 16) / 2;
+}
 
-	/* Task 1.1 - Setup double speed mode 
-				  modify U2X0 only to set it in UCSR0A for double speed mode */
-	//UCSR0A |= ???
-	UCSR0A |= (1 << U2X0);
+void i2c_start(void) 
+{
+TWCR = (1 << TWSTA) | (1 << TWEN) | (1 << TWINT);
+uint16_t timeout = 10000;
+while (!(TWCR & (1 << TWINT)) && --timeout);
+if (timeout == 0) 
+  {
+  ser_printf("I2C START timeout");
+  }
+}
 
-    UCSR0B = (1 << RXEN0) | (1 << TXEN0 );   // Enable transmitter/receiver
-	UCSR0C = (1 << UCSZ01) | (1 << UCSZ00); // 8-bit data, leaves parity/stop/mode to defaults (no parity, 1 stop, async)
+void i2c_stop(void) {
+  TWCR = (1 << TWSTO) | (1 << TWEN) | (1 << TWINT);
+  while (TWCR & (1 << TWSTO));
+}
+
+void i2c_write_address(uint8_t address) {
+  TWDR = address;
+  TWCR = (1 << TWEN) | (1 << TWINT);
+  uint16_t timeout = 10000;
+  while (!(TWCR & (1 << TWINT)) && --timeout);
+
+  uint8_t status = TWSR & 0xF8;
+  if (status == TW_MT_SLA_ACK || status == TW_MR_SLA_ACK) {
+    return;
+  }
+
+  ser_printf("Address write failed: TWSR=0x%02X\n", status);
+}
+
+void i2c_write(uint8_t data) {
+  TWDR = data;
+  TWCR = (1 << TWEN) | (1 << TWINT);
+  uint16_t timeout = 10000;
+  while (!(TWCR & (1 << TWINT)) && --timeout);
+
+  uint8_t status = TWSR & 0xF8;
+  if (status == TW_MT_SLA_ACK || status == TW_MT_DATA_ACK) {
+    return;
+  }
+
+  ser_printf("Write failed: TWSR=0x%02X\n", status);
+}
+
+uint8_t i2c_read_ack(void) {
+  TWCR = (1 << TWEN) | (1 << TWINT) | (1 << TWEA);
+  while (!(TWCR & (1 << TWINT)));
+  return TWDR;
+}
+
+uint8_t i2c_read_nack(void) {
+  TWCR = (1 << TWEN) | (1 << TWINT);
+  while (!(TWCR & (1 << TWINT)));
+  return TWDR;
+}
+
+/******************************************************************************
+ *   Function: scan_i2c_bus() - Scan I2C Bus
+ *      Pre condition: 
+ *          Hardware must be properly connected (BMP180 sensors, etc.)
+ *          i2c_init() must have been run
+ *      Post condition: 
+ *          Scans for connected devices and reports their addresses 
+ *******************************************************************************/
+void scan_i2c_bus(void) 
+{
+ser_printf("Scanning I2C addresses...\n");
+
+for (uint8_t addr = 0x8; addr <= 0x77; addr++) 
+  {
+  // Send START
+  TWCR = (1 << TWSTA) | (1 << TWEN) | (1 << TWINT);
+  while (!(TWCR & (1 << TWINT)));
+  // Send slave address with write bit (addr << 1 | 0)
+  TWDR = (addr << 1);
+  TWCR = (1 << TWEN) | (1 << TWINT);
+  while (!(TWCR & (1 << TWINT)));
+  // Check for ACK
+  uint8_t status = TWSR & 0xF8;
+  if (status == 0x18) 
+    { // SLA+W transmitted, ACK received
+        ser_printf("Device found at 0x%02X\n", addr);
+    }
+    // Send STOP
+    TWCR = (1 << TWEN) | (1 << TWSTO) | (1 << TWINT);
+    while (TWCR & (1 << TWSTO)); // Wait for stop to finish
+  }
+
+ser_printf("Scan complete.\n");
 }
 
 void ser_printf(const char *format, ...) {
@@ -211,17 +333,82 @@ void ser_printline(const char *str) {
     ser_write('\r'); // carriage return
 }
 
-char ser_read() {
-    while (!(UCSR0A & (1 << RXC0))) {
-        // Wait until data is received
-    }
-    return UDR0; // Return received byte from buffer
+char ser_read() 
+{
+while (!(UCSR0A & (1 << RXC0))) 
+  {
+  // Wait until data is received
+  }
+
+return UDR0; // Return received byte from buffer
 }
 
-void ser_write(const char c) {
-    while (!(UCSR0A & (1 << UDRE0))) {
-        // Wait until transmit buffer is empty
-    }
-    UDR0 = c; // Load data into transmit register
+void ser_write(const char c) 
+{
+while (!(UCSR0A & (1 << UDRE0))) 
+  {
+  // Wait until transmit buffer is empty
+  }
+
+UDR0 = c; // Load data into transmit register
 }
 
+void uart_init() 
+{
+    uint16_t ubrr = 16;
+	UBRR0H = (ubrr >> 8);
+    UBRR0L = ubrr;
+
+	UCSR0A |= (1 << U2X0);  //modify U2X0 only to set it in UCSR0A for double speed mode
+    UCSR0B = (1 << RXEN0) | (1 << TXEN0 );   // Enable transmitter/receiver
+	UCSR0C = (1 << UCSZ01) | (1 << UCSZ00); // 8-bit data, leaves parity/stop/mode to defaults (no parity, 1 stop, async)
+}
+/******************************************************************************
+ *  Timer Interrupt Functions
+ *******************************************************************************/
+
+uint16_t get_cycles(void) {
+	volatile uint16_t tcnt1 = TCNT1;
+
+					//Task 2.1
+	return tcnt1;		//This currently is hardcoded to return 0, we need to return the 16-bit current count.
+}
+
+void set_cycles(uint16_t cycle) {
+	//Task 2.2
+	volatile uint16_t* tcnt1 = (volatile uint16_t*)0x84;
+	*tcnt1 = 0;
+
+	volatile uint16_t* ocr1a = (volatile uint16_t*)0x88;
+	*ocr1a = cycle;
+	//Clear the count in Timer1
+	//Set the compare value in the OCR1A register
+
+}
+
+void enable_interrupt(void) {
+	sei(); // set SREG I-bit
+}
+
+void disable_interrupt(void) {
+	cli(); // clear SREG I-bit
+}
+
+void enable_timer_interrupt(void) {
+	TCCR1A = 0; // clear TCCR1A
+
+	TCCR1B = 0b1011; // set WGM12, set CS12 = 0, CS11 = 1, CS10 = 1 for div by 64 prescaler
+	TIMSK1 |= (1 << 1);
+	//Task 2.3
+	//In TCCR1B: Setup CTC mode, set the prescaler you will use with set_cycles() compare value
+	//In TIMSK1: Set the OCIE1A bit to enable the timer interrupt.
+	
+	//TCCR1B = xxx; 	
+	//TIMSK1 |= xxx; 	
+}
+
+void disable_timer_interrupt(void) {
+	//Task 2.4
+	//In TIMSK1: Clear the OCIE1A bit to disable the timer interrupt.
+	TIMSK1 &= ~(1 << 1);  //This will use the complement operator and a bitwise OR operation to clear just the bit specified by XXX
+}
